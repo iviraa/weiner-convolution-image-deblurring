@@ -1,26 +1,26 @@
-/* 
- * Example: MPI-based Wiener deconvolution for an RGB image.
- * 
- * This program performs image deblurring using the Wiener algorithm,
- * using MPI to process an RGB image in parallel.
- * 
- * - Uses STB libraries for loading/saving images
- * - Assumes input and PSF are the same size
- * - Each process handles a vertical slice of the image
- * 
- * Requirements:
- *   - FFTW3 library (https://www.fftw.org/)
- *   - STB single-file header libraries:
- *       https://github.com/nothings/stb/blob/master/stb_image.h
- *       https://github.com/nothings/stb/blob/master/stb_image_write.h
- *     (Download and place them in your project directory)
- *   - MS-MPI (for Windows) or OpenMPI (for Linux/macOS)
- * 
- * Compilation:
- *   mpicc wiener_parallel.c -lfftw3 -lm -o wiener_parallel
- * 
- * Execution:
- *   mpirun -np 4 ./wiener_parallel input.png psf.png output.png
+/* * Example: MPI-based Wiener deconvolution for batches of images.
+ * * This program performs image deblurring using the Wiener algorithm
+ * processing multiple image/PSF pairs in parallel using MPI master/worker model.
+ * * - Rank 0 finds image pairs (based on sigma in filename) and distributes tasks.
+ * - Worker ranks (1 to N-1) request tasks, perform serial deconvolution on
+ * the assigned image pair, and save the result.
+ * - Uses STB libraries for loading/saving images.
+ * - Uses POSIX dirent.h for directory scanning (Linux/macOS).
+ * * Requirements:
+ * - MPI Library (e.g., OpenMPI, MPICH, MS-MPI)
+ * - FFTW3 library (http://www.fftw.org/)
+ * - STB single-file header libraries (stb_image.h, stb_image_write.h)
+ * - A C compiler supporting C99+ (for dirent.h, snprintf)
+ * * Compilation:
+ * mpicc wiener_parallel_batch.c -lfftw3 -lm -o wiener_parallel_batch -std=c99
+ * * Execution:
+ * mpirun -np <num_processes> ./wiener_parallel_batch <input_dir> <output_dir> <base_name> [k_value]
+ * e.g., mpirun -np 5 ./wiener_parallel_batch output_data output_images pokhara 0.001
+ * * <num_processes> should ideally be >= 2 (1 master + 1 or more workers)
+ * <input_dir> : Directory containing blurred_*_sigmaX.Y.png and psf_*_sigmaX.Y.png files.
+ * <output_dir>: Directory where deblurred_*_sigmaX.Y.png files will be saved.
+ * <base_name> : The base name used in the filenames (e.g., 'pokhara').
+ * [k_value]   : Optional Wiener K value (default: 0.001).
  */
 
 #include <mpi.h>
@@ -29,537 +29,594 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dirent.h> // For directory scanning (POSIX)
+#include <sys/stat.h> // For mkdir (POSIX)
+#include <sys/types.h> // For mkdir (POSIX)
+#include <errno.h> // For errno
+#include <float.h> // For DBL_MAX
 
-/* 
-   STB libraries:
-   1) Place these #defines before including the .h files to enable implementations.
-   2) Download stb_image.h, stb_image_write.h from https://github.com/nothings/stb
-*/
+/* STB libraries */
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+// Define tags for MPI communication
+#define TAG_TASK_REQUEST 1
+#define TAG_TASK_SIGMA   2
+#define TAG_TERMINATE    3
 
-/* 
- * read_image_rgb:
- *   Reads a 3-channel RGB image from file and returns float data in range [0,1].
- *
- * Parameters:
- *   - path: path to the input image file (PNG, JPG, etc.)
- *   - out_w, out_h: pointers to store the image width and height
- *
- * Returns:
- *   - A float array of size (3 * width * height) containing RGB in row-major order
- *   - NULL on failure
- */
-static float *read_image_rgb(const char *path, int *out_w, int *out_h)
-{
-    int channels_in_file;
-    unsigned char *data_u8 = stbi_load(path, out_w, out_h, &channels_in_file, 3);
-    if (!data_u8) {
-        fprintf(stderr, "Error: Could not load image %s\n", path);
-        return NULL;
-    }
-    int w = *out_w;
-    int h = *out_h;
+// Termination signal for sigma value
+#define TERMINATION_SIGMA -1.0
 
-    /* Allocate float array for 3 channels. */
-    float *data_f = (float *)malloc(sizeof(float) * w * h * 3);
-    if (!data_f) {
-        fprintf(stderr, "Error: Could not allocate memory for image.\n");
-        stbi_image_free(data_u8);
-        return NULL;
-    }
+// --- Function Prototypes for Image/FFT Operations (reuse from serial) ---
+static float *read_image_rgb(const char *path, int *out_w, int *out_h);
+static float *read_image_gray(const char *path, int *out_w, int *out_h);
+static int write_image_rgb(const char *path, const float *data, int w, int h);
+static void center_psf(float *psf, int w, int h);
+static void normalize_psf(float *psf, int w, int h);
+static int wiener_deconv_channel(
+    const float *channel_in,
+    const float *full_psf,
+    float *channel_out,
+    int img_w,
+    int img_h,
+    double K); // Changed return type to int for error checking
+static int perform_deconvolution_for_sigma(
+    double sigma, 
+    const char* input_dir, 
+    const char* output_dir, 
+    const char* base_name, 
+    double K,
+    int rank); // New function for worker task
 
-    /* Convert from unsigned char [0..255] to float [0..1]. */
-    int i;
-    for (i = 0; i < w * h * 3; i++) {
-        data_f[i] = (float)(data_u8[i]) / 255.0f;
-    }
-
-    stbi_image_free(data_u8);
-    return data_f;
-}
-
-/*
- * read_image_gray:
- *   Loads a grayscale image and converts it to floating-point format.
- *
- * Parameters:
- *   - path: file path to the input image
- *   - out_w, out_h: pointers to receive image dimensions
- *
- * Returns:
- *   - Float array containing normalized [0..1] pixel values
- *   - NULL if loading fails
- */
-static float *read_image_gray(const char *path, int *out_w, int *out_h)
-{
-    int channels_in_file;
-    unsigned char *data_u8 = stbi_load(path, out_w, out_h, &channels_in_file, 1);
-    if (!data_u8) {
-        fprintf(stderr, "Error: Could not load image %s\n", path);
-        return NULL;
-    }
-    int w = *out_w;
-    int h = *out_h;
-
-    float *data_f = (float *)malloc(sizeof(float) * w * h);
-    if (!data_f) {
-        fprintf(stderr, "Error: Could not allocate memory for PSF.\n");
-        stbi_image_free(data_u8);
-        return NULL;
-    }
-
-    int i;
-    for (i = 0; i < w * h; i++) {
-        data_f[i] = (float)(data_u8[i]) / 255.0f;
-    }
-
-    stbi_image_free(data_u8);
-    return data_f;
-}
-
-/*
- * write_image_rgb:
- *   Saves a floating-point RGB image as a PNG file.
- *
- * Parameters:
- *   - path: output file path
- *   - data: float array with RGB values in range [0..1]
- *   - w, h: width and height of the image
- *
- * Returns:
- *   - 1 on success, 0 on failure
- *
- * Notes:
- *   - Values outside [0..1] range are clamped
- */
-static int write_image_rgb(const char *path, const float *data, int w, int h)
-{
-    /* Convert from float [0..1] to unsigned char [0..255]. */
-    unsigned char *out_u8 = (unsigned char *)malloc(w * h * 3);
-    if (!out_u8) {
-        fprintf(stderr, "Error: cannot allocate memory for output image.\n");
-        return 0;
-    }
-    int i;
-    for (i = 0; i < w * h * 3; i++) {
-        float val = data[i];
-        if (val < 0.0f) val = 0.0f;
-        if (val > 1.0f) val = 1.0f;
-        out_u8[i] = (unsigned char)(val * 255.0f + 0.5f);
-    }
-
-    /* stbi_write_png expects row-major with 3 channels. */
-    int ret = stbi_write_png(path, w, h, 3, out_u8, w * 3);
-    free(out_u8);
-    if (!ret) {
-        fprintf(stderr, "Error: stbi_write_png failed for %s\n", path);
-        return 0;
-    }
-    return 1;
-}
-
-/*
- * center_psf:
- *   Rearranges PSF quadrants to center it for FFT processing.
- *
- * Parameters:
- *   - psf: the point spread function data to be centered
- *   - w, h: dimensions of the PSF image
- *
- * Notes:
- *   - Modifies the PSF in-place
- *   - Required for proper frequency-domain processing
- */
-static void center_psf(float *psf, int w, int h) 
-{
-    float *temp = (float *)malloc(w * h * sizeof(float));
-    if (!temp) {
-        fprintf(stderr, "Error: Out of memory in center_psf\n");
-        return;
-    }
-    
-    int i, j;
-    /* Copy to temporary buffer */
-    for (i = 0; i < h; i++) {
-        for (j = 0; j < w; j++) {
-            temp[i*w + j] = psf[i*w + j];
+// --- Helper Function ---
+// Simple function to create directory (POSIX specific)
+int create_directory(const char *path) {
+    struct stat st = {0};
+    if (stat(path, &st) == -1) {
+        // Use mode 0755 (rwxr-xr-x)
+        if (mkdir(path, 0755) != 0) {
+             if (errno != EEXIST) { // Don't error if it already exists
+                perror("Error creating directory");
+                return 0; // Failure
+             }
         }
+    } else if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Error: %s exists but is not a directory\n", path);
+        return 0; // Failure
     }
-    
-    /* Rearrange quadrants to center the PSF */
-    int half_h = h / 2;
-    int half_w = w / 2;
-    
-    for (i = 0; i < h; i++) {
-        for (j = 0; j < w; j++) {
-            int new_i = (i + half_h) % h;
-            int new_j = (j + half_w) % w;
-            psf[new_i*w + new_j] = temp[i*w + j];
-        }
-    }
-    
-    free(temp);
-}
-
-/*
- * normalize_psf:
- *   Scales the PSF values so they sum to 1.0 (energy conservation).
- *
- * Parameters:
- *   - psf: the point spread function data to normalize
- *   - w, h: dimensions of the PSF image
- *
- * Notes:
- *   - Modifies the PSF in-place
- */
-static void normalize_psf(float *psf, int w, int h)
-{
-    double sum = 0.0;
-    int i;
-    
-    /* Calculate sum */
-    for (i = 0; i < w * h; i++) {
-        sum += psf[i];
-    }
-    
-    /* Avoid division by zero */
-    if (sum > 1e-10) {
-        for (i = 0; i < w * h; i++) {
-            psf[i] /= sum;
-        }
-    } else {
-        fprintf(stderr, "Warning: PSF sum is too small for normalization\n");
-    }
-}
-
-/*
- * wiener_deconv_patch_1ch:
- *   Performs Wiener deconvolution on a single-channel image patch.
- * 
- * Parameters:
- *   - patch_in: input blurred image data
- *   - patch_psf: point spread function data
- *   - patch_out: buffer for deconvolved result
- *   - patch_w, patch_h: dimensions of all patches
- *   - K: Wiener regularization parameter (controls noise sensitivity)
- *
- * Notes:
- *   - Uses FFT to perform deconvolution in frequency domain
- *   - K parameter balances deblurring vs. noise amplification
- */
-static void wiener_deconv_patch_1ch(
-    float *patch_in,
-    float *patch_psf,
-    float *patch_out,
-    int patch_w,
-    int patch_h,
-    double K
-) {
-    int N = patch_w * patch_h;
-    int i;
-    
-    /* Create temporary copy of PSF for centering and normalization */
-    float *psf_copy = (float *)malloc(sizeof(float) * N);
-    if (!psf_copy) {
-        fprintf(stderr, "Error: Out of memory for PSF processing\n");
-        return;
-    }
-    
-    for (i = 0; i < N; i++) {
-        psf_copy[i] = patch_psf[i];
-    }
-    
-    /* Center and normalize the PSF */
-    center_psf(psf_copy, patch_w, patch_h);
-    normalize_psf(psf_copy, patch_w, patch_h);
-
-    /* Allocate double arrays for FFTW. We must convert float->double. */
-    double *in_spatial  = (double *)fftw_malloc(sizeof(double) * N);
-    double *psf_spatial = (double *)fftw_malloc(sizeof(double) * N);
-    
-    /* Copy data to double arrays */
-    for (i = 0; i < N; i++) {
-        in_spatial[i]  = (double)patch_in[i];
-        psf_spatial[i] = (double)psf_copy[i];
-    }
-    
-    /* For 2D real-to-complex transforms, we need different dimensions */
-    int n_complex_out = patch_h * (patch_w/2 + 1); /* FFTW r2c format */
-
-    /* Frequency-domain (complex) buffers with correct size for r2c transform */
-    fftw_complex *freq_in  = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
-    fftw_complex *freq_psf = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
-    fftw_complex *freq_out = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
-
-    /* Plans */
-    fftw_plan p_fwd_in = fftw_plan_dft_r2c_2d(patch_h, patch_w,
-                                             in_spatial, freq_in,
-                                             FFTW_ESTIMATE);
-    fftw_plan p_fwd_psf = fftw_plan_dft_r2c_2d(patch_h, patch_w,
-                                              psf_spatial, freq_psf,
-                                              FFTW_ESTIMATE);
-
-    fftw_plan p_inv_out = fftw_plan_dft_c2r_2d(patch_h, patch_w,
-                                              freq_out, in_spatial,
-                                              FFTW_ESTIMATE);
-
-    /* Forward FFT */
-    fftw_execute(p_fwd_in);
-    fftw_execute(p_fwd_psf);
-
-    /* Apply Wiener filter:
-       D(k) = B(k)*conjugate(H(k)) / (|H(k)|^2 + K)
-       We store result in freq_out.
-    */
-    for (i = 0; i < n_complex_out; i++) {
-        double B_r = freq_in[i][0];
-        double B_i = freq_in[i][1];
-        double H_r = freq_psf[i][0];
-        double H_i = freq_psf[i][1];
-
-        double mag2 = H_r*H_r + H_i*H_i;  /* |H|^2 */
-        double denom = mag2 + K;
-
-        /* B * conj(H) = (B_r*H_r + B_i*H_i) + j(B_i*H_r - B_r*H_i) */
-        double num_r = B_r*H_r + B_i*H_i;
-        double num_i = B_i*H_r - B_r*H_i;
-
-        if (denom < 1e-15) {
-            freq_out[i][0] = 0.0;
-            freq_out[i][1] = 0.0;
-        } else {
-            freq_out[i][0] = num_r / denom;
-            freq_out[i][1] = num_i / denom;
-        }
-    }
-
-    /* Inverse FFT => in_spatial. Then convert back to float. */
-    fftw_execute(p_inv_out);
-
-    /* Normalize since FFTW doesn't do it automatically. */
-    for (i = 0; i < N; i++) {
-        double val = in_spatial[i] / (double)N;  /* scale by 1/N */
-        patch_out[i] = (float)val;
-    }
-
-    /* Cleanup */
-    fftw_destroy_plan(p_fwd_in);
-    fftw_destroy_plan(p_fwd_psf);
-    fftw_destroy_plan(p_inv_out);
-
-    fftw_free(freq_in);
-    fftw_free(freq_psf);
-    fftw_free(freq_out);
-    fftw_free(in_spatial);
-    fftw_free(psf_spatial);
-    free(psf_copy);
+    return 1; // Success or already exists as directory
 }
 
 
-/*
- * main:
- *   Entry point for the MPI-based Wiener deconvolution program.
- *
- * Usage:
- *   mpirun -np <processes> ./wiener_parallel input.png psf.png output.png [k_value]
- *
- * Steps:
- *   1) Load input RGB image and PSF on rank 0
- *   2) Divide image into vertical slices distributed to all ranks
- *   3) Each rank performs Wiener deconvolution on its slice
- *   4) Results are gathered and combined on rank 0
- *   5) Final deblurred image is saved to disk
- */
-int main(int argc, char **argv)
-{
+// ======================== MAIN ========================
+int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    if (argc < 4) {
+    if (size < 2) {
         if (rank == 0) {
-            fprintf(stderr, "Usage: %s <input_rgb> <psf_gray> <output> [k_value]\n", argv[0]);
+            fprintf(stderr, "Error: This program requires at least 2 MPI processes (1 master, 1+ workers).\n");
         }
         MPI_Finalize();
         return 1;
     }
 
-    const char *input_path  = argv[1];
-    const char *psf_path    = argv[2];
-    const char *output_path = argv[3];
-
-    /* Wiener regularization constant. 
-       Can be passed as 4th argument or use default. 
-       Try different values between 0.001 and 0.1 */
-    double K = 0.01;
-    if (argc > 4) {
-        K = atof(argv[4]);
-    }
-    
-    if (rank == 0) {
-        printf("Using Wiener K value: %f\n", K);
-    }
-
-    /* Image dimensions. Only rank 0 will read initially. */
-    int img_w = 0, img_h = 0;
-    int psf_w = 0, psf_h = 0;
-
-    float *full_img = NULL;  /* [3 * w * h], float in [0..1] */
-    float *psf_img  = NULL;  /* single-channel [w_psf * h_psf] */
-
-    /* Final deblurred image on rank 0. */
-    float *full_deblur = NULL;
+    // --- Argument Parsing and Broadcasting ---
+    char input_dir[FILENAME_MAX];
+    char output_dir[FILENAME_MAX];
+    char base_name[FILENAME_MAX];
+    double K = 0.001; // Default K value
 
     if (rank == 0) {
-        /* Load the color image. */
-        full_img = read_image_rgb(input_path, &img_w, &img_h);
-        if (!full_img) {
-            fprintf(stderr, "Could not load input image.\n");
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s <input_dir> <output_dir> <base_name> [k_value]\n", argv[0]);
+            // Signal all processes to abort
+            MPI_Abort(MPI_COMM_WORLD, 1); 
+        }
+        strncpy(input_dir, argv[1], FILENAME_MAX - 1);
+        strncpy(output_dir, argv[2], FILENAME_MAX - 1);
+        strncpy(base_name, argv[3], FILENAME_MAX - 1);
+        input_dir[FILENAME_MAX - 1] = '\0'; // Ensure null termination
+        output_dir[FILENAME_MAX - 1] = '\0';
+        base_name[FILENAME_MAX - 1] = '\0';
+
+        if (argc > 4) {
+            K = atof(argv[4]);
+            if (K < 0) {
+                fprintf(stderr, "Warning: K value cannot be negative. Using default K = %f\n", 0.001);
+                K = 0.001;
+            }
+        }
+        printf("Master (Rank 0): Input='%s', Output='%s', Base='%s', K=%.4f\n", input_dir, output_dir, base_name, K);
+        
+        // Create output directory
+        if (!create_directory(output_dir)) {
+             fprintf(stderr, "Master (Rank 0): Failed to create or access output directory '%s'. Aborting.\n", output_dir);
+             MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    // Broadcast necessary arguments from Rank 0 to all other ranks
+    MPI_Bcast(input_dir, FILENAME_MAX, MPI_CHAR, 0, MPI_COMM_WORLD);
+    MPI_Bcast(output_dir, FILENAME_MAX, MPI_CHAR, 0, MPI_COMM_WORLD);
+    MPI_Bcast(base_name, FILENAME_MAX, MPI_CHAR, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&K, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // --- Master Logic (Rank 0) ---
+    if (rank == 0) {
+        DIR *dir;
+        struct dirent *entry;
+        double *sigma_tasks = NULL; // Dynamically allocated array for sigma values
+        int task_count = 0;
+        int task_capacity = 0;
+        char pattern_blur[FILENAME_MAX];
+        char pattern_psf[FILENAME_MAX];
+
+        // Prepare filename patterns for sscanf
+        snprintf(pattern_blur, FILENAME_MAX, "%s_blurred_sigma%%lf.png", base_name);
+        snprintf(pattern_psf, FILENAME_MAX, "%s_psf_sigma%%lf.png", base_name);
+
+        printf("Master: Scanning input directory '%s' for tasks...\n", input_dir);
+        dir = opendir(input_dir);
+        if (!dir) {
+            perror("Master: Error opening input directory");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        /* Load single-channel PSF. */
-        psf_img = read_image_gray(psf_path, &psf_w, &psf_h);
-        if (!psf_img) {
-            fprintf(stderr, "Could not load PSF image.\n");
-            free(full_img);
-            MPI_Abort(MPI_COMM_WORLD, 1);
+        // --- Scan Directory to Find Tasks ---
+        while ((entry = readdir(dir)) != NULL) {
+            double current_sigma;
+            // Try matching the blurred filename pattern
+            if (sscanf(entry->d_name, pattern_blur, &current_sigma) == 1) {
+                // Found a potential blurred file, check for corresponding PSF
+                char psf_filename[FILENAME_MAX];
+                char psf_filepath[FILENAME_MAX];
+                snprintf(psf_filename, FILENAME_MAX, "%s_psf_sigma%.1f.png", base_name, current_sigma);
+                snprintf(psf_filepath, FILENAME_MAX, "%s/%s", input_dir, psf_filename);
+
+                struct stat st;
+                if (stat(psf_filepath, &st) == 0 && S_ISREG(st.st_mode)) {
+                    // PSF file exists, add sigma to task list if not already present
+                    int found = 0;
+                    for(int i = 0; i < task_count; ++i) {
+                         // Use a tolerance for float comparison
+                         if (fabs(sigma_tasks[i] - current_sigma) < 1e-5) {
+                              found = 1;
+                              break;
+                         }
+                    }
+                    if (!found) {
+                         // Resize task array if needed
+                         if (task_count >= task_capacity) {
+                              task_capacity = (task_capacity == 0) ? 10 : task_capacity * 2;
+                              double *new_tasks = (double*)realloc(sigma_tasks, task_capacity * sizeof(double));
+                              if (!new_tasks) {
+                                   fprintf(stderr, "Master: Failed to allocate memory for tasks.\n");
+                                   free(sigma_tasks); // Free previous allocation
+                                   closedir(dir);
+                                   MPI_Abort(MPI_COMM_WORLD, 1);
+                              }
+                              sigma_tasks = new_tasks;
+                         }
+                         sigma_tasks[task_count++] = current_sigma;
+                         printf("Master: Found valid task pair for sigma %.1f\n", current_sigma);
+                    }
+                }
+            }
+        }
+        closedir(dir);
+        printf("Master: Found %d tasks.\n", task_count);
+
+        if (task_count == 0) {
+             printf("Master: No valid blurred/PSF pairs found. Telling workers to terminate.\n");
         }
 
-        /* Resize PSF if needed to match image dimensions.
-           In this simple version, we'll just warn about mismatches. */
-        if (psf_w != img_w || psf_h != img_h) {
-            fprintf(stderr, 
-                "Warning: PSF size (%dx%d) != image size (%dx%d).\n"
-                "This may cause issues with deconvolution.\n",
-                psf_w, psf_h, img_w, img_h);
+        // --- Distribute Tasks ---
+        int tasks_assigned = 0;
+        int workers_terminated = 0;
+        MPI_Status status;
+
+        // While there are workers still running
+        while (workers_terminated < (size - 1)) {
+            int worker_rank;
+            // Wait for a message from any worker
+            MPI_Recv(&worker_rank, 1, MPI_INT, MPI_ANY_SOURCE, TAG_TASK_REQUEST, MPI_COMM_WORLD, &status);
+
+            // Check if there are tasks left to assign
+            if (tasks_assigned < task_count) {
+                double sigma_to_send = sigma_tasks[tasks_assigned];
+                MPI_Send(&sigma_to_send, 1, MPI_DOUBLE, status.MPI_SOURCE, TAG_TASK_SIGMA, MPI_COMM_WORLD);
+                tasks_assigned++;
+            } else {
+                // No tasks left, tell the worker to terminate
+                double terminate_signal = TERMINATION_SIGMA;
+                MPI_Send(&terminate_signal, 1, MPI_DOUBLE, status.MPI_SOURCE, TAG_TERMINATE, MPI_COMM_WORLD);
+                workers_terminated++;
+            }
         }
+        printf("Master: All tasks assigned and workers terminated.\n");
+        free(sigma_tasks); // Free the task list
 
-        /* Allocate full deblurred output. */
-        full_deblur = (float *)malloc(sizeof(float)*3*img_w*img_h);
-        if (!full_deblur) {
-            fprintf(stderr, "Out of memory.\n");
-            free(full_img);
-            free(psf_img);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
+    } 
+    // --- Worker Logic (Ranks > 0) ---
+    else { 
+        int my_rank = rank; // For clarity in messages
+        printf("Worker (Rank %d): Ready for tasks.\n", my_rank);
 
-    /* Broadcast the dimensions to all ranks. */
-    MPI_Bcast(&img_w, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&img_h, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&psf_w, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&psf_h, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        while (1) {
+            // Request a task from the master
+            MPI_Send(&my_rank, 1, MPI_INT, 0, TAG_TASK_REQUEST, MPI_COMM_WORLD);
 
-    if (img_w <= 0 || img_h <= 0) {
-        if (rank == 0)
-            fprintf(stderr, "Error: invalid image dimensions.\n");
-        MPI_Finalize();
-        return 1;
-    }
+            // Receive sigma value or termination signal
+            double received_sigma;
+            MPI_Status status;
+            MPI_Recv(&received_sigma, 1, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
-    /* Each process gets a vertical slice: 
-       patch_height = img_h / size  (assuming it divides evenly)
-       The slice is the entire width (img_w) for each color channel, 
-       but only patch_height rows. 
-       We'll do 3 separate single-channel slices for R, G, B.
-    */
-    if (img_h % size != 0) {
-        if (rank == 0) {
-            fprintf(stderr, 
-                "This example code requires that img_h (%d) is divisible by the number of ranks (%d).\n",
-                img_h, size);
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    int patch_h = img_h / size;
-    int patch_w = img_w;
+            // Check if it's the termination signal
+            if (status.MPI_TAG == TAG_TERMINATE || received_sigma == TERMINATION_SIGMA) {
+                printf("Worker (Rank %d): Received termination signal. Exiting.\n", my_rank);
+                break; // Exit the loop
+            }
 
-    /* For convenience, let's define the sub-image size for each channel. */
-    int patch_size_1ch = patch_w * patch_h; /* single-channel */
-    int patch_size_3ch = patch_size_1ch * 3; /* for the full RGB slice */
-
-    /* Allocate buffers for this rank's slice of the image (RGB) */
-    float *slice_in = (float *)malloc(sizeof(float)*patch_size_3ch);
-    float *slice_out= (float *)malloc(sizeof(float)*patch_size_3ch);
-
-    /* Allocate a slice of the PSF (single channel). */
-    float *psf_slice = (float *)malloc(sizeof(float)*patch_size_1ch);
-
-    /* Scatter the input image. 
-       3 * w * h floats total => we chop into 'size' vertical slices.
-       Each slice is patch_size_3ch floats. 
-    */
-    MPI_Scatter(
-        /* sendbuf   = full_img [on rank 0], recvbuf = slice_in [on others] */
-        full_img, patch_size_3ch, MPI_FLOAT,
-        slice_in, patch_size_3ch, MPI_FLOAT,
-        0, MPI_COMM_WORLD
-    );
-
-    /* Scatter the PSF image (single-channel). */
-    MPI_Scatter(
-        psf_img, patch_size_1ch, MPI_FLOAT,
-        psf_slice, patch_size_1ch, MPI_FLOAT,
-        0, MPI_COMM_WORLD
-    );
-
-    /* Now we have an RGB slice in slice_in (size = patch_size_3ch).
-       We'll treat each channel separately for Wiener deconvolution. 
-       That means we do 3 calls to wiener_deconv_patch_1ch:
-         R => slice_in[0..patch_size_1ch-1]
-         G => slice_in[patch_size_1ch..2*patch_size_1ch-1]
-         B => slice_in[2*patch_size_1ch..3*patch_size_1ch-1]
-       The PSF slice is single-channel (psf_slice).
-    */
-    float *slice_in_R = slice_in;                    
-    float *slice_in_G = slice_in + patch_size_1ch;   
-    float *slice_in_B = slice_in + 2*patch_size_1ch;
-
-    float *slice_out_R = slice_out;
-    float *slice_out_G = slice_out + patch_size_1ch;
-    float *slice_out_B = slice_out + 2*patch_size_1ch;
-
-    /* Deconvolution on each channel. */
-    wiener_deconv_patch_1ch(slice_in_R, psf_slice, slice_out_R, patch_w, patch_h, K);
-    wiener_deconv_patch_1ch(slice_in_G, psf_slice, slice_out_G, patch_w, patch_h, K);
-    wiener_deconv_patch_1ch(slice_in_B, psf_slice, slice_out_B, patch_w, patch_h, K);
-
-    /* Gather the results back to rank 0. */
-    MPI_Gather(
-        slice_out, patch_size_3ch, MPI_FLOAT,
-        full_deblur, patch_size_3ch, MPI_FLOAT,
-        0, MPI_COMM_WORLD
-    );
-
-    /* Rank 0 writes the final image. */
-    if (rank == 0) {
-        /* Write to PNG. We assume [0..1] float range. */
-        if (!write_image_rgb(output_path, full_deblur, img_w, img_h)) {
-            fprintf(stderr, "Failed to write output image %s\n", output_path);
-        } else {
-            printf("Wrote deblurred image to %s\n", output_path);
-        }
-    }
-
-    /* Cleanup */
-    free(slice_in);
-    free(slice_out);
-    free(psf_slice);
-
-    if (rank == 0) {
-        free(full_img);
-        free(psf_img);
-        free(full_deblur);
-    }
+            // Process the assigned sigma value
+            if (status.MPI_TAG == TAG_TASK_SIGMA) {
+                printf("Worker (Rank %d): Received task for sigma %.1f\n", my_rank, received_sigma);
+                
+                // Perform the actual deconvolution work
+                int success = perform_deconvolution_for_sigma(received_sigma, input_dir, output_dir, base_name, K, my_rank);
+                
+                if (success) {
+                     printf("Worker (Rank %d): Successfully processed sigma %.1f\n", my_rank, received_sigma);
+                } else {
+                     fprintf(stderr, "Worker (Rank %d): Failed to process sigma %.1f\n", my_rank, received_sigma);
+                     // Decide if failure should abort or just continue
+                }
+            } else {
+                 // Unexpected tag - should not happen in this logic
+                 fprintf(stderr, "Worker (Rank %d): Received message with unexpected tag %d. Terminating.\n", my_rank, status.MPI_TAG);
+                 break;
+            }
+        } // End of worker loop
+    } // End of worker logic
 
     MPI_Finalize();
     return 0;
 }
+
+
+// ======================== Deconvolution Task Function ========================
+/*
+ * perform_deconvolution_for_sigma:
+ * Loads the relevant images for a given sigma, performs Wiener deconvolution,
+ * and saves the result. Called by worker processes.
+ *
+ * Returns: 1 on success, 0 on failure.
+ */
+static int perform_deconvolution_for_sigma(
+    double sigma, 
+    const char* input_dir, 
+    const char* output_dir, 
+    const char* base_name, 
+    double K,
+    int rank // Pass rank for logging
+) {
+    char blurred_filename[FILENAME_MAX];
+    char psf_filename[FILENAME_MAX];
+    char output_filename[FILENAME_MAX];
+    char blurred_filepath[FILENAME_MAX];
+    char psf_filepath[FILENAME_MAX];
+    char output_filepath[FILENAME_MAX];
+
+    // Construct filenames using sigma with 1 decimal place
+    snprintf(blurred_filename, FILENAME_MAX, "%s_blurred_sigma%.1f.png", base_name, sigma);
+    snprintf(psf_filename, FILENAME_MAX, "%s_psf_sigma%.1f.png", base_name, sigma);
+    snprintf(output_filename, FILENAME_MAX, "%s_deblurred_sigma%.1f.png", base_name, sigma);
+
+    snprintf(blurred_filepath, FILENAME_MAX, "%s/%s", input_dir, blurred_filename);
+    snprintf(psf_filepath, FILENAME_MAX, "%s/%s", input_dir, psf_filename);
+    snprintf(output_filepath, FILENAME_MAX, "%s/%s", output_dir, output_filename);
+
+    // --- Load Images ---
+    int img_w = 0, img_h = 0;
+    int psf_w = 0, psf_h = 0;
+    float *img_in_rgb = read_image_rgb(blurred_filepath, &img_w, &img_h);
+    if (!img_in_rgb) {
+        fprintf(stderr, "Worker (Rank %d): Failed to load blurred image '%s'.\n", rank, blurred_filepath);
+        return 0; // Failure
+    }
+    float *psf_gray = read_image_gray(psf_filepath, &psf_w, &psf_h);
+    if (!psf_gray) {
+        fprintf(stderr, "Worker (Rank %d): Failed to load PSF image '%s'.\n", rank, psf_filepath);
+        free(img_in_rgb);
+        return 0; // Failure
+    }
+    // printf("Worker (Rank %d): Loaded images for sigma %.1f (%dx%d)\n", rank, sigma, img_w, img_h);
+
+    // --- Sanity Checks ---
+     if (img_w <= 0 || img_h <= 0) {
+         fprintf(stderr, "Worker (Rank %d): Invalid image dimensions loaded (%dx%d) for sigma %.1f.\n", rank, img_w, img_h, sigma);
+         free(img_in_rgb); free(psf_gray);
+         return 0;
+     }
+    if (psf_w != img_w || psf_h != img_h) {
+        fprintf(stderr, "Worker (Rank %d): Error! PSF dimensions (%dx%d) must match image dimensions (%dx%d) for sigma %.1f.\n", rank, psf_w, psf_h, img_w, img_h, sigma);
+        free(img_in_rgb); free(psf_gray);
+        return 0; // Failure
+    }
+
+    // --- Prepare PSF ---
+    center_psf(psf_gray, psf_w, psf_h);
+    normalize_psf(psf_gray, psf_w, psf_h);
+
+    // --- Allocate Memory ---
+    int N = img_w * img_h;
+    float *img_out_rgb = (float *)malloc(sizeof(float) * N * 3);
+    float *channel_r_in = (float *)malloc(sizeof(float) * N);
+    float *channel_g_in = (float *)malloc(sizeof(float) * N);
+    float *channel_b_in = (float *)malloc(sizeof(float) * N);
+    float *channel_r_out = (float *)malloc(sizeof(float) * N);
+    float *channel_g_out = (float *)malloc(sizeof(float) * N);
+    float *channel_b_out = (float *)malloc(sizeof(float) * N);
+
+    if (!img_out_rgb || !channel_r_in || !channel_g_in || !channel_b_in ||
+        !channel_r_out || !channel_g_out || !channel_b_out) {
+        fprintf(stderr, "Worker (Rank %d): Failed to allocate memory for channel processing (sigma %.1f).\n", rank, sigma);
+        free(img_in_rgb); free(psf_gray); free(img_out_rgb);
+        free(channel_r_in); free(channel_g_in); free(channel_b_in);
+        free(channel_r_out); free(channel_g_out); free(channel_b_out);
+        return 0; // Failure
+    }
+
+    // --- Separate Color Channels ---
+    int i, pixel_idx;
+    for (i = 0; i < N; ++i) {
+        pixel_idx = i * 3;
+        channel_r_in[i] = img_in_rgb[pixel_idx + 0];
+        channel_g_in[i] = img_in_rgb[pixel_idx + 1];
+        channel_b_in[i] = img_in_rgb[pixel_idx + 2];
+    }
+
+    // --- Perform Wiener Deconvolution on each channel ---
+    // printf("Worker (Rank %d): Starting deconvolution for sigma %.1f...\n", rank, sigma);
+    int success_r = wiener_deconv_channel(channel_r_in, psf_gray, channel_r_out, img_w, img_h, K);
+    int success_g = wiener_deconv_channel(channel_g_in, psf_gray, channel_g_out, img_w, img_h, K);
+    int success_b = wiener_deconv_channel(channel_b_in, psf_gray, channel_b_out, img_w, img_h, K);
+
+    if (!success_r || !success_g || !success_b) {
+         fprintf(stderr, "Worker (Rank %d): Deconvolution failed for one or more channels (sigma %.1f).\n", rank, sigma);
+         // Cleanup and return failure
+         free(img_in_rgb); free(psf_gray); free(img_out_rgb);
+         free(channel_r_in); free(channel_g_in); free(channel_b_in);
+         free(channel_r_out); free(channel_g_out); free(channel_b_out);
+         return 0; // Failure
+    }
+    // printf("Worker (Rank %d): Deconvolution finished for sigma %.1f.\n", rank, sigma);
+
+
+    // --- Combine Channels into Output Image ---
+    for (i = 0; i < N; ++i) {
+        pixel_idx = i * 3;
+        img_out_rgb[pixel_idx + 0] = channel_r_out[i];
+        img_out_rgb[pixel_idx + 1] = channel_g_out[i];
+        img_out_rgb[pixel_idx + 2] = channel_b_out[i];
+    }
+
+    // --- Save Output Image ---
+    if (!write_image_rgb(output_filepath, img_out_rgb, img_w, img_h)) {
+        fprintf(stderr, "Worker (Rank %d): Failed to write output image '%s'.\n", rank, output_filepath);
+        // Continue to cleanup even if writing fails, but report failure
+         free(img_in_rgb); free(psf_gray); free(img_out_rgb);
+         free(channel_r_in); free(channel_g_in); free(channel_b_in);
+         free(channel_r_out); free(channel_g_out); free(channel_b_out);
+        return 0; // Failure
+    } else {
+        // printf("Worker (Rank %d): Successfully wrote deblurred image '%s'\n", rank, output_filepath);
+    }
+
+    // --- Cleanup ---
+    free(img_in_rgb);
+    free(psf_gray);
+    free(img_out_rgb);
+    free(channel_r_in);
+    free(channel_g_in);
+    free(channel_b_in);
+    free(channel_r_out);
+    free(channel_g_out);
+    free(channel_b_out);
+
+    return 1; // Success
+}
+
+
+// ======================== Image/FFT Functions (from serial) ========================
+
+// --- Implementations of read_image_rgb, read_image_gray, write_image_rgb, ---
+// --- center_psf, normalize_psf, wiener_deconv_channel ---
+// --- (These functions are identical to the ones in wiener_serial.c,      ---
+// ---  except wiener_deconv_channel now returns int for success/failure) ---
+
+
+static float *read_image_rgb(const char *path, int *out_w, int *out_h) {
+    int channels_in_file;
+    unsigned char *data_u8 = stbi_load(path, out_w, out_h, &channels_in_file, 3); 
+    if (!data_u8) {
+        // fprintf(stderr, "Error: Could not load image %s\n", path); // Reduced verbosity
+        return NULL;
+    }
+    int w = *out_w;
+    int h = *out_h;
+    float *data_f = (float *)malloc(sizeof(float) * w * h * 3);
+    if (!data_f) {
+        fprintf(stderr, "Error: Could not allocate memory for image.\n");
+        stbi_image_free(data_u8);
+        return NULL;
+    }
+    for (int i = 0; i < w * h * 3; i++) {
+        data_f[i] = (float)(data_u8[i]) / 255.0f;
+    }
+    stbi_image_free(data_u8);
+    return data_f;
+}
+
+static float *read_image_gray(const char *path, int *out_w, int *out_h) {
+    int channels_in_file;
+    unsigned char *data_u8 = stbi_load(path, out_w, out_h, &channels_in_file, 1); 
+    if (!data_u8) {
+        // fprintf(stderr, "Error: Could not load image %s\n", path); // Reduced verbosity
+        return NULL;
+    }
+    int w = *out_w;
+    int h = *out_h;
+    float *data_f = (float *)malloc(sizeof(float) * w * h);
+    if (!data_f) {
+        fprintf(stderr, "Error: Could not allocate memory for PSF.\n");
+        stbi_image_free(data_u8);
+        return NULL;
+    }
+    for (int i = 0; i < w * h; i++) {
+        data_f[i] = (float)(data_u8[i]) / 255.0f;
+    }
+    stbi_image_free(data_u8);
+    return data_f;
+}
+
+static int write_image_rgb(const char *path, const float *data, int w, int h) {
+    unsigned char *out_u8 = (unsigned char *)malloc(sizeof(unsigned char) * w * h * 3);
+    if (!out_u8) {
+        fprintf(stderr, "Error: cannot allocate memory for output image.\n");
+        return 0;
+    }
+    for (int i = 0; i < w * h * 3; i++) {
+        float val = data[i];
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+        out_u8[i] = (unsigned char)(val * 255.0f + 0.5f);
+    }
+    int stride_bytes = w * 3;
+    int ret = stbi_write_png(path, w, h, 3, out_u8, stride_bytes);
+    free(out_u8);
+    if (!ret) {
+        // fprintf(stderr, "Error: stbi_write_png failed for %s\n", path); // Reduced verbosity
+        return 0;
+    }
+    return 1;
+}
+
+static void center_psf(float *psf, int w, int h) {
+    float *temp = (float *)malloc(w * h * sizeof(float));
+    if (!temp) {
+        fprintf(stderr, "Error: Out of memory in center_psf\n");
+        return; 
+    }
+    memcpy(temp, psf, w * h * sizeof(float));
+    int half_w = w / 2;
+    int half_h = h / 2;
+    for (int i = 0; i < h; i++) {
+        for (int j = 0; j < w; j++) {
+            int src_i = i;
+            int src_j = j;
+            int dst_i = (i + half_h) % h;
+            int dst_j = (j + half_w) % w;
+            psf[dst_i * w + dst_j] = temp[src_i * w + src_j];
+        }
+    }
+    free(temp);
+}
+
+static void normalize_psf(float *psf, int w, int h) {
+    double sum = 0.0;
+    for (int i = 0; i < w * h; i++) {
+        sum += psf[i];
+    }
+    if (fabs(sum) > 1e-10) {
+        for (int i = 0; i < w * h; i++) {
+            psf[i] /= (float)sum;
+        }
+    } else {
+        fprintf(stderr, "Warning: PSF sum is close to zero (%e). Normalization skipped.\n", sum);
+    }
+}
+
+static int wiener_deconv_channel(
+    const float *channel_in,
+    const float *full_psf, 
+    float *channel_out,
+    int img_w,
+    int img_h,
+    double K
+) {
+    int N = img_w * img_h;
+    double *in_spatial  = (double *)fftw_malloc(sizeof(double) * N);
+    double *psf_spatial = (double *)fftw_malloc(sizeof(double) * N);
+    double *out_spatial = (double *)fftw_malloc(sizeof(double) * N); 
+    if (!in_spatial || !psf_spatial || !out_spatial) {
+        fprintf(stderr, "Error: FFTW malloc failed for spatial buffers.\n");
+        fftw_free(in_spatial); fftw_free(psf_spatial); fftw_free(out_spatial);
+        return 0; // Failure
+    }
+    for (int i = 0; i < N; i++) {
+        in_spatial[i]  = (double)channel_in[i];
+        psf_spatial[i] = (double)full_psf[i];
+    }
+    int n_complex_out = img_h * (img_w / 2 + 1); 
+    fftw_complex *freq_in  = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
+    fftw_complex *freq_psf = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
+    fftw_complex *freq_out = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * n_complex_out);
+    if (!freq_in || !freq_psf || !freq_out) {
+        fprintf(stderr, "Error: FFTW malloc failed for complex buffers.\n");
+        fftw_free(in_spatial); fftw_free(psf_spatial); fftw_free(out_spatial);
+        fftw_free(freq_in); fftw_free(freq_psf); fftw_free(freq_out);
+        return 0; // Failure
+    }
+
+    fftw_plan p_fwd_in = fftw_plan_dft_r2c_2d(img_h, img_w, in_spatial, freq_in, FFTW_ESTIMATE);
+    fftw_plan p_fwd_psf = fftw_plan_dft_r2c_2d(img_h, img_w, psf_spatial, freq_psf, FFTW_ESTIMATE);
+    fftw_plan p_inv_out = fftw_plan_dft_c2r_2d(img_h, img_w, freq_out, out_spatial, FFTW_ESTIMATE);
+
+     if (!p_fwd_in || !p_fwd_psf || !p_inv_out) {
+         fprintf(stderr, "Error: Failed to create FFTW plans.\n");
+         fftw_destroy_plan(p_fwd_in); fftw_destroy_plan(p_fwd_psf); fftw_destroy_plan(p_inv_out);
+         fftw_free(in_spatial); fftw_free(psf_spatial); fftw_free(out_spatial);
+         fftw_free(freq_in); fftw_free(freq_psf); fftw_free(freq_out);
+         return 0; // Failure
+    }
+
+    fftw_execute(p_fwd_in);
+    fftw_execute(p_fwd_psf);
+
+    for (int i = 0; i < n_complex_out; i++) {
+        double B_r = freq_in[i][0]; double B_i = freq_in[i][1];
+        double H_r = freq_psf[i][0]; double H_i = freq_psf[i][1];
+        double H_mag_sq = H_r * H_r + H_i * H_i; 
+        double denom = H_mag_sq + K;
+        double num_r = B_r * H_r + B_i * H_i;
+        double num_i = B_i * H_r - B_r * H_i;
+        if (fabs(denom) < DBL_MIN) { // Use DBL_MIN for safety
+            freq_out[i][0] = 0.0; freq_out[i][1] = 0.0;
+        } else {
+            freq_out[i][0] = num_r / denom; freq_out[i][1] = num_i / denom;
+        }
+    }
+
+    fftw_execute(p_inv_out);
+
+    double scale = 1.0 / (double)N;
+    for (int i = 0; i < N; i++) {
+        channel_out[i] = (float)(out_spatial[i] * scale);
+    }
+
+    fftw_destroy_plan(p_fwd_in);
+    fftw_destroy_plan(p_fwd_psf);
+    fftw_destroy_plan(p_inv_out);
+    fftw_free(freq_in); fftw_free(freq_psf); fftw_free(freq_out);
+    fftw_free(in_spatial); fftw_free(psf_spatial); fftw_free(out_spatial);
+    
+    return 1; // Success
+}
+
+
