@@ -77,10 +77,10 @@ The project consists of two main implementations:
 
 ```bash
 # Serial version
-gcc serial/weiner_serial.c -lfftw3 -lm -o serial/wiener_serial
+mpicc serial/weiner_serial.c       -Iinclude       -I/modules/pkgs/prev/fftw/3.3.6/openmpi-gcc/4.0.5/include       -L/modules/pkgs/prev/fftw/3.3.6/openmpi-gcc/4.0.5/lib       -lfftw3 -lm       -o wiener_serial_mpi
 
 # Parallel version
-mpicc parallel/weiner_parallel.c -lfftw3 -lm -o parallel/wiener_parallel
+mpicc parallel/weiner_parallel.c       -Iinclude       -I/modules/pkgs/prev/fftw/3.3.6/openmpi-gcc/4.0.5/include       -L/modules/pkgs/prev/fftw/3.3.6/openmpi-gcc/4.0.5/lib       -lfftw3 -lm       -o wiener_parallel
 ```
 
 ## Usage
@@ -88,16 +88,16 @@ mpicc parallel/weiner_parallel.c -lfftw3 -lm -o parallel/wiener_parallel
 1. Place your input images in the `images/raw/` directory
 2. Preprocess the image (apply synthetic blur):
    ```bash
-   python python_scripts/preprocess_image.py --input_file <input_image> --sigma <blur_amount>
+python python_scripts/preprocess_image.py pokhara.jpg input_images --base_name pokhara
    ```
 3. Run the deblurring program:
 
    ```bash
    # Serial version
-   ./serial/wiener_serial input.png psf.png output.png [k_value]
+    ./run_serial_on_all_images.sh
 
    # Parallel version
-   mpirun -np <num_processes> ./parallel/wiener_parallel input.png psf.png output.png
+    (torch) [axdahal@magnolia01 weiner-convolution-image-deblurring]$ mpirun -np 2 ./wiener_parallel input_images output_parallel pokhara 0.001
    ```
 
 ## Performance Comparison
