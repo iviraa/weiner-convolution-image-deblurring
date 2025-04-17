@@ -6,6 +6,7 @@ import argparse
 import os
 import glob # To find files matching a pattern
 import re   # To extract sigma from filename
+import math # For ceil
 
 def load_image(image_path):
     """Loads an image using OpenCV and converts to RGB."""
@@ -62,7 +63,6 @@ def find_sigma_pairs(blurred_dir, deblurred_dir, base_name):
             # Check if the corresponding deblurred file exists
             if os.path.exists(deblurred_file_path):
                 sigma_files[sigma] = {'blurred': blurred_file_path, 'deblurred': deblurred_file_path}
-                # print(f"Found pair for sigma {sigma_str}") # Optional: verbosity
             else:
                 print(f"Warning: Deblurred file missing for sigma {sigma_str}: {deblurred_file_path}")
 
@@ -74,7 +74,8 @@ def find_sigma_pairs(blurred_dir, deblurred_dir, base_name):
 
 def plot_grid_comparison(original_img, sigma_pairs, main_title, output_filename):
     """
-    Creates and saves a grid plot comparing original, blurred, and deblurred images for multiple sigma values.
+    Creates and saves a wider grid plot comparing original, blurred, and deblurred images 
+    for multiple sigma values, arranged in side-by-side blocks.
 
     Args:
         original_img (numpy.ndarray): The original sharp image (RGB).
@@ -89,41 +90,62 @@ def plot_grid_comparison(original_img, sigma_pairs, main_title, output_filename)
     # Sort the sigma values for consistent plot order
     sorted_sigmas = sorted(sigma_pairs.keys())
     num_sigmas = len(sorted_sigmas)
+    
+    # --- Determine Grid Layout ---
+    # We want blocks of 2 columns (Blurred | Deblurred)
+    # Arrange these blocks side-by-side. Let's aim for 2 blocks wide (4 columns total)
+    pairs_per_block_col = 4 # Target number of pairs vertically in each block
+    num_block_cols = 2 # Number of side-by-side blocks (each block is 2 image columns wide)
+    grid_cols = num_block_cols * 2 # Total columns for pairs (Blurred | Deblurred | Blurred | Deblurred)
+    # Calculate rows needed for pairs: ceiling(num_sigmas / num_block_cols)
+    grid_rows_pairs = math.ceil(num_sigmas / num_block_cols) 
+    
+    # Total rows = 1 (for original) + rows needed for pairs
+    total_rows = 1 + grid_rows_pairs 
 
     # Use a visually appealing style
     plt.style.use('seaborn-v0_8-whitegrid')
 
     # --- Create Figure and GridSpec Layout ---
-    # Need num_sigmas rows for pairs + 1 row for the original image
-    # 2 columns for blurred/deblurred pairs
-    # Adjust figsize: width 10 is reasonable for 2 columns, height depends on number of sigmas
-    fig_height = 3 + num_sigmas * 2.5 # Base height + height per sigma row
-    fig = plt.figure(figsize=(10, fig_height)) 
+    # Adjust figsize: make it wider, height depends on pair rows
+    fig_width = 18 # Wider to accommodate 4 image columns
+    fig_height = 4 + grid_rows_pairs * 3 # Base height + height per pair row
+    fig = plt.figure(figsize=(fig_width, fig_height)) 
 
-    # Create a grid: (num_sigmas + 1) rows, 2 columns
-    # The first row is for the original image, spanning both columns
-    # The subsequent rows are for blurred/deblurred pairs
-    gs = gridspec.GridSpec(num_sigmas +1 , 2, figure=fig, hspace=0.2, wspace=0.0) # Add spacing
+    # Create the main grid spec
+    gs = gridspec.GridSpec(total_rows, grid_cols, figure=fig, 
+                           hspace=0.3, # Adjust vertical space
+                           wspace=0.1) # Adjust horizontal space
 
-    # --- Plot Original Image (Top Row) ---
-    ax_orig = fig.add_subplot(gs[0, :]) # Span columns 0 and 1 in row 0
+    # --- Plot Original Image (Top Row, Spanning All Columns) ---
+    ax_orig = fig.add_subplot(gs[0, :]) # Span all columns in row 0
     if original_img is not None:
         ax_orig.imshow(original_img)
-        ax_orig.set_title('Original Sharp Image', fontsize=16, pad=10) # Add padding
+        ax_orig.set_title('Original Sharp Image', fontsize=18, pad=15) # Larger padding
     else:
-        ax_orig.set_title('Original Image Not Loaded', fontsize=16, pad=10, color='red')
+        ax_orig.set_title('Original Image Not Loaded', fontsize=18, pad=15, color='red')
     ax_orig.axis('off')
 
-    # --- Plot Blurred/Deblurred Pairs ---
+    # --- Plot Blurred/Deblurred Pairs in the Grid ---
+    print(f"Arranging {num_sigmas} pairs into {grid_rows_pairs}x{num_block_cols} blocks (each 1x2 images)")
     for i, sigma in enumerate(sorted_sigmas):
-        row_index = i + 1 # Start plotting pairs from the second row (index 1)
         
+        # Calculate position in the grid
+        # block_col_index determines which vertical block (0 or 1)
+        block_col_index = i % num_block_cols 
+        # row_in_block determines the row within that block's vertical space
+        row_in_block = i // num_block_cols 
+        
+        # Calculate actual grid coordinates
+        target_row = row_in_block + 1 # Add 1 because original image is in row 0
+        target_col_start = block_col_index * 2 # Each block takes 2 columns
+
         paths = sigma_pairs[sigma]
         blurred_img = load_image(paths['blurred'])
         deblurred_img = load_image(paths['deblurred'])
 
         # Plot Blurred Image
-        ax_blur = fig.add_subplot(gs[row_index, 0]) # Row i+1, Column 0
+        ax_blur = fig.add_subplot(gs[target_row, target_col_start]) 
         if blurred_img is not None:
             ax_blur.imshow(blurred_img)
             ax_blur.set_title(f'Blurred (Sigma={sigma:.1f})', fontsize=12)
@@ -132,7 +154,7 @@ def plot_grid_comparison(original_img, sigma_pairs, main_title, output_filename)
         ax_blur.axis('off')
 
         # Plot Deblurred Image
-        ax_deblur = fig.add_subplot(gs[row_index, 1]) # Row i+1, Column 1
+        ax_deblur = fig.add_subplot(gs[target_row, target_col_start + 1]) # Next column over
         if deblurred_img is not None:
             ax_deblur.imshow(deblurred_img)
             ax_deblur.set_title(f'Deblurred (Sigma={sigma:.1f})', fontsize=12)
@@ -142,21 +164,20 @@ def plot_grid_comparison(original_img, sigma_pairs, main_title, output_filename)
 
 
     # Add a main title for the entire figure
-    fig.suptitle(main_title, fontsize=20, y=.9) # Adjust y based on figsize/layout
+    fig.suptitle(main_title, fontsize=22, y=.93) # Adjust y position if needed
 
-    # Adjust layout slightly AFTER adding titles
-    # gs.tight_layout(fig, rect=[0, 0, 1, 0.97]) # Adjust rect to make space for suptitle
-    # plt.tight_layout(rect=[0, 0.01, 1, 0.97]) # Give suptitle slightly more space
+    # Adjust layout AFTER adding titles
+    # plt.tight_layout(rect=[0, 0.01, 1, 0.99]) # Adjust rect to make space for suptitle
 
     # Save the plot
     try:
-        plt.savefig(output_filename, bbox_inches='tight', dpi=500)
+        plt.savefig(output_filename, bbox_inches='tight', dpi=350) # Use dpi=150 or higher
         print(f"Comparison grid plot saved successfully to {output_filename}")
     except Exception as e:
         print(f"Error saving plot to {output_filename}: {e}")
 
     # Optionally display the plot
-    plt.show()
+    # plt.show()
     
     # Close the plot figure to free memory
     plt.close(fig)
@@ -170,7 +191,6 @@ def main():
     parser.add_argument("--blurred_dir", required=True, help="Directory containing the blurred images.")
     parser.add_argument("--deblurred_dir", required=True, help="Directory containing the deblurred output images.")
     parser.add_argument("--base_name", required=True, help="Base name used for the image files (e.g., 'pokhara').")
-    # Removed --sigma argument as we now find all sigmas
     parser.add_argument("--output_plot", required=True, help="Path to save the output plot grid image (e.g., 'comparison_grid.png').")
 
     args = parser.parse_args()
@@ -188,8 +208,6 @@ def main():
     original_img = load_image(args.original_image)
     if original_img is None:
         print("Warning: Could not load original image. Plot will proceed without it.")
-        # Decide if you want to exit here or plot without the original
-        # return 
 
     # Create the plot
     plot_title = f"Wiener Deconvolution Results Grid: {args.base_name.capitalize()}"
