@@ -88,17 +88,22 @@ mpicc parallel/weiner_parallel.c       -Iinclude       -I/modules/pkgs/prev/fftw
 1. Place your input images in the `images/raw/` directory
 2. Preprocess the image (apply synthetic blur):
    ```bash
-python python_scripts/preprocess_image.py pokhara.jpg input_images --base_name pokhara
+    python python_scripts/preprocess_image.py pokhara.jpg input_images --base_name pokhara
    ```
 3. Run the deblurring program:
 
    ```bash
-   # Serial version
-    ./run_serial_on_all_images.sh
+       # Serial version
+        ./run_serial_on_all_images.sh
 
-   # Parallel version
-    (torch) [axdahal@magnolia01 weiner-convolution-image-deblurring]$ mpirun -np 2 ./wiener_parallel input_images output_parallel pokhara 0.001
+       # Parallel version
+      (torch) [axdahal@magnolia01 weiner-convolution-image-deblurring]$ mpirun -np 2 ./wiener_parallel input_images output_parallel pokhara 0.001
    ```
+
+```
+# qualitative analysis
+python python_scripts/qualitative_grid.py --original_image pokhara.jpg --blurred_dir input_images --deblurred_dir output_images --base_name pokhara --output_plot quialitative_grid.png
+```
 
 ## Performance Comparison
 
