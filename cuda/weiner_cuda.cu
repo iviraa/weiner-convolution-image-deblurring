@@ -17,13 +17,11 @@
  * nvcc -arch=sm_37 wiener_cuda_batch.cu -o wiener_cuda_batch -lcufft -lm
  *
  * Execution:
- * ./wiener_cuda_batch <input_dir> <output_dir> <base_name> [k_value]
- * e.g., ./wiener_cuda_batch output_data output_images_cuda pokhara 0.001
+ * ./wiener_cuda_batch <input_dir> <output_dir> <base_name> [k_value] [threads_per_block_config]
+ * e.g., ./wiener_cuda_batch output_data output_images_cuda pokhara 0.001 256
  *
- * <input_dir> : Directory containing blurred_*_sigmaX.Y.png and psf_*_sigmaX.Y.png files.
- * <output_dir>: Directory where deblurred_*_sigmaX.Y.png files will be saved.
- * <base_name> : The base name used in the filenames (e.g., 'pokhara').
- * [k_value]   : Optional Wiener K value (default: 0.001).
+ * [threads_per_block_config]: Optional. Integer to suggest threads per block for 1D kernels.
+ *                             Also influences 2D block dimensions. If <=0 or not given, defaults are used.
  */
 
 #include <cuda_runtime.h>
@@ -57,6 +55,7 @@
     } while (0)
 
 static const char *_cudaGetCufftErrorString(cufftResult error) {
+    // ... (error string function as before)
     switch (error) {
         case CUFFT_SUCCESS: return "CUFFT_SUCCESS";
         case CUFFT_INVALID_PLAN: return "CUFFT_INVALID_PLAN";
@@ -89,10 +88,11 @@ static const char *_cudaGetCufftErrorString(cufftResult error) {
         }                                                                              \
     } while (0)
 
-// Thread block dimensions
-#define THREADS_PER_BLOCK_2D_X 16
-#define THREADS_PER_BLOCK_2D_Y 16
-#define THREADS_PER_BLOCK_1D 256
+// Default Thread block dimensions
+#define DEFAULT_THREADS_PER_BLOCK_1D 256
+#define DEFAULT_THREADS_PER_BLOCK_2D_X 16
+#define DEFAULT_THREADS_PER_BLOCK_2D_Y 16
+#define MAX_THREADS_PER_BLOCK_GPU 1024 // General GPU limit
 
 
 // --- Function Prototypes for Image/CPU Operations (mostly from serial) ---
@@ -103,7 +103,7 @@ static void center_psf(float *psf, int w, int h);
 static void normalize_psf(float *psf, int w, int h);
 int create_directory(const char *path); // Forward declaration
 
-// --- CUDA Kernels (unchanged) ---
+// --- CUDA Kernels ---
 __global__ void wiener_filter_kernel(
     cufftComplex *freq_in,
     cufftComplex *freq_psf,
@@ -124,7 +124,7 @@ __global__ void wiener_filter_kernel(
         cufftComplex num;
         num.x = H.x * B.x + H.y * B.y;
         num.y = H.x * B.y - H.y * B.x;
-        if (fabsf(denom) < 1e-9f) {
+        if (fabsf(denom) < 1e-9f) { // Use fabsf for float
             freq_out[idx].x = 0.0f;
             freq_out[idx].y = 0.0f;
         } else {
@@ -143,11 +143,12 @@ __global__ void scale_kernel(float *data, int N, float scale_factor) {
 
 // --- Function Prototypes for CUDA Operations ---
 static int wiener_deconv_channel_cuda(
-    float *d_channel_spatial_managed, // Managed device pointer for spatial in/out
-    float *d_psf_spatial_managed,     // Managed device pointer to PSF (float)
+    float *d_channel_spatial_managed,
+    float *d_psf_spatial_managed,
     int img_w,
     int img_h,
-    float K_val);
+    float K_val,
+    int user_tpb_config); 
 
 static int perform_deconvolution_for_sigma_cuda(
     double sigma,
@@ -155,13 +156,17 @@ static int perform_deconvolution_for_sigma_cuda(
     const char* output_dir,
     const char* base_name,
     double K_param,
-    int task_idx);
+    int task_idx,
+    int user_tpb_config);
 
 
 // ======================== MAIN ========================
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <input_dir> <output_dir> <base_name> [k_value]\n", argv[0]);
+    
+    if (argc < 4 || argc > 6) { // Min 4 args, Max 6 args
+        fprintf(stderr, "Usage: %s <input_dir> <output_dir> <base_name> [k_value] [threads_per_block_config]\n", argv[0]);
+        fprintf(stderr, "  [k_value] (optional): Wiener K constant (default 0.001)\n");
+        fprintf(stderr, "  [threads_per_block_config] (optional): Integer for 1D kernel TPB (e.g., 256). Influences 2D TPB. Default uses built-in values.\n");
         return 1;
     }
 
@@ -169,6 +174,7 @@ int main(int argc, char **argv) {
     char output_dir[FILENAME_MAX];
     char base_name_str[FILENAME_MAX];
     double K = 0.001;
+    int user_tpb_config = -1; // Default: use internal defaults
 
     strncpy(input_dir, argv[1], FILENAME_MAX - 1);
     strncpy(output_dir, argv[2], FILENAME_MAX - 1);
@@ -184,14 +190,35 @@ int main(int argc, char **argv) {
             K = 0.001;
         }
     }
+    if (argc > 5) {
+        user_tpb_config = atoi(argv[5]);
+        if (user_tpb_config <= 0 || user_tpb_config > MAX_THREADS_PER_BLOCK_GPU) {
+            fprintf(stderr,
+                    "Warning: Invalid threads_per_block_config (%d). Must be > 0 and <= %d. Using defaults.\n",
+                    user_tpb_config, MAX_THREADS_PER_BLOCK_GPU);
+            user_tpb_config = -1; // Revert to default behavior
+        } else if (user_tpb_config % 32 != 0) {
+            fprintf(stderr,
+                    "Warning: threads_per_block_config (%d) is not a multiple of 32. This might lead to suboptimal performance.\n",
+                    user_tpb_config);
+        }
+    }
+
     printf("CUDA Wiener Deconvolution: Input='%s', Output='%s', Base='%s', K=%.4f\n",
            input_dir, output_dir, base_name_str, K);
+    if (user_tpb_config > 0) {
+        printf("CUDA Config: User-defined Threads Per Block (1D baseline) = %d\n", user_tpb_config);
+    } else {
+        printf("CUDA Config: Using default thread block sizes.\n");
+    }
+
 
     if (!create_directory(output_dir)) {
          fprintf(stderr, "Failed to create or access output directory '%s'. Aborting.\n", output_dir);
          return 1;
     }
 
+    // ... directory scanning logic ...
     DIR *dir_handle;
     struct dirent *entry;
     double *sigma_tasks = NULL;
@@ -235,7 +262,7 @@ int main(int argc, char **argv) {
                           sigma_tasks = new_tasks;
                      }
                      sigma_tasks[task_count++] = current_sigma;
-                     printf("Found valid task pair for sigma %.1f\n", current_sigma);
+                     // printf("Found valid task pair for sigma %.1f\n", current_sigma); // Reduced verbosity
                 }
             }
         }
@@ -249,23 +276,23 @@ int main(int argc, char **argv) {
          return 0;
     }
 
+
     struct timeval start_time, end_time;
     double elapsed_time;
-
-    gettimeofday(&start_time, NULL); // Start timing for all tasks
+    gettimeofday(&start_time, NULL);
 
     int tasks_succeeded = 0;
     for (int i = 0; i < task_count; ++i) {
         printf("\nProcessing task %d/%d: sigma %.1f\n", i + 1, task_count, sigma_tasks[i]);
-        if (perform_deconvolution_for_sigma_cuda(sigma_tasks[i], input_dir, output_dir, base_name_str, K, i)) {
+        if (perform_deconvolution_for_sigma_cuda(sigma_tasks[i], input_dir, output_dir, base_name_str, K, i, user_tpb_config)) {
             tasks_succeeded++;
-            printf("Successfully processed sigma %.1f\n", sigma_tasks[i]);
+            // printf("Successfully processed sigma %.1f\n", sigma_tasks[i]); // Reduced verbosity
         } else {
             fprintf(stderr, "Failed to process sigma %.1f\n", sigma_tasks[i]);
         }
     }
 
-    gettimeofday(&end_time, NULL); // End timing
+    gettimeofday(&end_time, NULL);
     elapsed_time = (end_time.tv_sec - start_time.tv_sec) +
                    (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
 
@@ -275,7 +302,12 @@ int main(int argc, char **argv) {
     printf(" Total tasks processed:   %8d\n", task_count);
     printf(" Tasks succeeded:         %8d\n", tasks_succeeded);
     printf(" K value used:            %10.4f\n", K);
-    printf(" Total GPU processing time: %.6f seconds\n", elapsed_time);
+    if (user_tpb_config > 0) {
+        printf(" User TPB config:         %8d\n", user_tpb_config);
+    } else {
+        printf(" User TPB config:         %8s\n", "Default");
+    }
+    printf(" Total processing time:   %.6f seconds\n", elapsed_time);
     printf("--------------------------------------------------------\n\n");
 
     free(sigma_tasks);
@@ -290,7 +322,8 @@ static int perform_deconvolution_for_sigma_cuda(
     const char* output_dir,
     const char* base_name,
     double K_param,
-    int task_idx)
+    int task_idx,
+    int user_tpb_config)
 {
     char blurred_filename[FILENAME_MAX];
     char psf_filename[FILENAME_MAX];
@@ -301,7 +334,7 @@ static int perform_deconvolution_for_sigma_cuda(
 
     snprintf(blurred_filename, FILENAME_MAX, "%s_blurred_sigma%.1f.png", base_name, sigma);
     snprintf(psf_filename, FILENAME_MAX, "%s_psf_sigma%.1f.png", base_name, sigma);
-    snprintf(output_filename, FILENAME_MAX, "%s_deblurred_sigma%.1f_cuda.png", base_name, sigma); // Suffix to distinguish output
+    snprintf(output_filename, FILENAME_MAX, "%s_deblurred_sigma%.1f_cuda.png", base_name, sigma);
 
     snprintf(blurred_filepath, FILENAME_MAX, "%s/%s", input_dir, blurred_filename);
     snprintf(psf_filepath, FILENAME_MAX, "%s/%s", input_dir, psf_filename);
@@ -319,7 +352,7 @@ static int perform_deconvolution_for_sigma_cuda(
         fprintf(stderr, "Task %d (sigma %.1f): Failed to load PSF image '%s'.\n", task_idx, sigma, psf_filepath);
         free(h_img_in_rgb); return 0;
     }
-    printf("Task %d (sigma %.1f): Loaded images (%dx%d), PSF (%dx%d)\n", task_idx, sigma, img_w, img_h, psf_w, psf_h);
+    // printf("Task %d (sigma %.1f): Loaded images (%dx%d), PSF (%dx%d)\n", task_idx, sigma, img_w, img_h, psf_w, psf_h); // Reduced
 
     if (img_w <= 0 || img_h <= 0 || psf_w != img_w || psf_h != img_h) {
          fprintf(stderr, "Task %d (sigma %.1f): Invalid/mismatched image/PSF dimensions.\n", task_idx, sigma);
@@ -354,7 +387,6 @@ static int perform_deconvolution_for_sigma_cuda(
     }
     free(h_img_in_rgb);
 
-    // --- Allocate GPU Managed Memory ---
     float *d_channel_data_managed, *d_psf_managed;
     CUDA_CHECK(cudaMallocManaged((void **)&d_channel_data_managed, N_spatial * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged((void **)&d_psf_managed, N_spatial * sizeof(float)));
@@ -366,34 +398,31 @@ static int perform_deconvolution_for_sigma_cuda(
     float K_float = (float)K_param;
     int success_r = 0, success_g = 0, success_b = 0;
 
-    // --- Process Red Channel ---
-    printf("Task %d (sigma %.1f): Processing R channel...\n", task_idx, sigma);
+    // printf("Task %d (sigma %.1f): Processing R channel...\n", task_idx, sigma); // Reduced verbosity
     memcpy(d_channel_data_managed, h_channel_r_in, N_spatial * sizeof(float));
     CUDA_CHECK(cudaDeviceSynchronize());
-    success_r = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float);
+    success_r = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float, user_tpb_config);
     if (success_r) {
         CUDA_CHECK(cudaDeviceSynchronize());
         memcpy(h_channel_r_out, d_channel_data_managed, N_spatial * sizeof(float));
     }
 
-    // --- Process Green Channel ---
     if (success_r) {
-        printf("Task %d (sigma %.1f): Processing G channel...\n", task_idx, sigma);
+        // printf("Task %d (sigma %.1f): Processing G channel...\n", task_idx, sigma); // Reduced verbosity
         memcpy(d_channel_data_managed, h_channel_g_in, N_spatial * sizeof(float));
         CUDA_CHECK(cudaDeviceSynchronize());
-        success_g = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float);
+        success_g = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float, user_tpb_config);
         if (success_g) {
             CUDA_CHECK(cudaDeviceSynchronize());
             memcpy(h_channel_g_out, d_channel_data_managed, N_spatial * sizeof(float));
         }
     }
 
-    // --- Process Blue Channel ---
     if (success_g) {
-        printf("Task %d (sigma %.1f): Processing B channel...\n", task_idx, sigma);
+        // printf("Task %d (sigma %.1f): Processing B channel...\n", task_idx, sigma); // Reduced verbosity
         memcpy(d_channel_data_managed, h_channel_b_in, N_spatial * sizeof(float));
         CUDA_CHECK(cudaDeviceSynchronize());
-        success_b = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float);
+        success_b = wiener_deconv_channel_cuda(d_channel_data_managed, d_psf_managed, img_w, img_h, K_float, user_tpb_config);
         if (success_b) {
             CUDA_CHECK(cudaDeviceSynchronize());
             memcpy(h_channel_b_out, d_channel_data_managed, N_spatial * sizeof(float));
@@ -402,7 +431,6 @@ static int perform_deconvolution_for_sigma_cuda(
 
     CUDA_CHECK(cudaFree(d_channel_data_managed));
     CUDA_CHECK(cudaFree(d_psf_managed));
-
     free(h_channel_r_in); free(h_channel_g_in); free(h_channel_b_in);
 
     if (!success_r || !success_g || !success_b) {
@@ -418,7 +446,7 @@ static int perform_deconvolution_for_sigma_cuda(
         h_img_out_rgb[i * 3 + 2] = h_channel_b_out[i];
     }
 
-    printf("Task %d (sigma %.1f): Saving deblurred image to '%s'\n", task_idx, sigma, output_filepath);
+    // printf("Task %d (sigma %.1f): Saving deblurred image to '%s'\n", task_idx, sigma, output_filepath); // Reduced
     if (!write_image_rgb(output_filepath, h_img_out_rgb, img_w, img_h)) {
         fprintf(stderr, "Task %d (sigma %.1f): Failed to write output image '%s'.\n", task_idx, sigma, output_filepath);
         free(h_img_out_rgb);
@@ -434,11 +462,12 @@ static int perform_deconvolution_for_sigma_cuda(
 
 // ======================== CUDA Wiener Deconvolution for a Single Channel ========================
 static int wiener_deconv_channel_cuda(
-    float *d_channel_spatial_managed, // Managed memory for spatial input & output
-    float *d_psf_spatial_managed,     // Managed memory for PSF
+    float *d_channel_spatial_managed,
+    float *d_psf_spatial_managed,
     int img_w,
     int img_h,
-    float K_val)
+    float K_val,
+    int user_tpb_config) // Added user_tpb_config
 {
     int N_spatial = img_w * img_h;
     int img_w_complex = img_w / 2 + 1;
@@ -460,20 +489,67 @@ static int wiener_deconv_channel_cuda(
     CUFFT_CHECK(cufftExecR2C(plan_r2c_in, d_channel_spatial_managed, d_freq_in_managed));
     CUFFT_CHECK(cufftExecR2C(plan_r2c_psf, d_psf_spatial_managed, d_freq_psf_managed));
 
-    dim3 threadsPerBlock2D(THREADS_PER_BLOCK_2D_X, THREADS_PER_BLOCK_2D_Y);
+    // --- Determine actual threads per block based on user input or defaults ---
+    int actual_tpb_1d;
+    int actual_tpb_2d_x, actual_tpb_2d_y;
+
+    if (user_tpb_config > 0) { // User provided a configuration
+        // For 1D kernel
+        actual_tpb_1d = user_tpb_config; // Assumes user_tpb_config is already validated in main
+
+        // For 2D kernel: try to make it square-ish or use user_tpb_config as one dimension
+        if (user_tpb_config <= 32 && (user_tpb_config * user_tpb_config <= MAX_THREADS_PER_BLOCK_GPU)) {
+            // If user_tpb_config is small enough, try a square block
+            actual_tpb_2d_x = user_tpb_config;
+            actual_tpb_2d_y = user_tpb_config;
+        } else if (user_tpb_config <= MAX_THREADS_PER_BLOCK_GPU / DEFAULT_THREADS_PER_BLOCK_2D_Y) {
+            // If user_tpb_config is larger, use it for X and default for Y, if total is okay
+            actual_tpb_2d_x = user_tpb_config;
+            actual_tpb_2d_y = DEFAULT_THREADS_PER_BLOCK_2D_Y;
+            if (actual_tpb_2d_x * actual_tpb_2d_y > MAX_THREADS_PER_BLOCK_GPU) { // Fallback
+                 actual_tpb_2d_x = DEFAULT_THREADS_PER_BLOCK_2D_X;
+                 actual_tpb_2d_y = DEFAULT_THREADS_PER_BLOCK_2D_Y;
+            }
+        }
+        else { // User config too large for simple 2D derivation, use defaults for 2D
+            actual_tpb_2d_x = DEFAULT_THREADS_PER_BLOCK_2D_X;
+            actual_tpb_2d_y = DEFAULT_THREADS_PER_BLOCK_2D_Y;
+        }
+    } else { // User did not provide config, or it was invalid; use defaults
+        actual_tpb_1d = DEFAULT_THREADS_PER_BLOCK_1D;
+        actual_tpb_2d_x = DEFAULT_THREADS_PER_BLOCK_2D_X;
+        actual_tpb_2d_y = DEFAULT_THREADS_PER_BLOCK_2D_Y;
+    }
+    // Final check on 2D dimensions to ensure they don't exceed total
+    if (actual_tpb_2d_x * actual_tpb_2d_y > MAX_THREADS_PER_BLOCK_GPU) {
+        // This can happen if DEFAULT_THREADS_PER_BLOCK_2D_X/Y are too large, or logic above has a flaw
+        fprintf(stderr, "Error: Calculated 2D TPB %dx%d=%d exceeds max %d. Reverting to safe defaults.\n",
+                actual_tpb_2d_x, actual_tpb_2d_y, actual_tpb_2d_x * actual_tpb_2d_y, MAX_THREADS_PER_BLOCK_GPU);
+        actual_tpb_2d_x = 16; // Safe default
+        actual_tpb_2d_y = 16; // Safe default
+    }
+
+
+    // --- Launch Wiener Filter Kernel ---
+    dim3 threadsPerBlock2D(actual_tpb_2d_x, actual_tpb_2d_y);
     dim3 numBlocks2D(
         (img_w_complex + threadsPerBlock2D.x - 1) / threadsPerBlock2D.x,
         (img_h + threadsPerBlock2D.y - 1) / threadsPerBlock2D.y);
+    // printf("Wiener Kernel Launch: Grid(%u,%u), Block(%u,%u)\n", // Reduced verbosity
+    //       numBlocks2D.x, numBlocks2D.y, threadsPerBlock2D.x, threadsPerBlock2D.y);
     wiener_filter_kernel<<<numBlocks2D, threadsPerBlock2D>>>(
         d_freq_in_managed, d_freq_psf_managed, d_freq_out_managed, img_w_complex, img_h, K_val);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    // --- Inverse FFT ---
     CUFFT_CHECK(cufftExecC2R(plan_c2r_out, d_freq_out_managed, d_channel_spatial_managed));
 
+    // --- Scale Output of IFFT ---
     float scale_factor = 1.0f / (float)N_spatial;
-    dim3 threadsPerBlock1D(THREADS_PER_BLOCK_1D);
+    dim3 threadsPerBlock1D(actual_tpb_1d);
     dim3 numBlocks1D((N_spatial + threadsPerBlock1D.x - 1) / threadsPerBlock1D.x);
+    // printf("Scale Kernel Launch: Grid(%u), Block(%u)\n", numBlocks1D.x, threadsPerBlock1D.x); // Reduced verbosity
     scale_kernel<<<numBlocks1D, threadsPerBlock1D>>>(d_channel_spatial_managed, N_spatial, scale_factor);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -489,7 +565,7 @@ static int wiener_deconv_channel_cuda(
     return 1; // Success
 }
 
-// ======================== Image/CPU Utility Functions (unchanged) ========================
+// ======================== Image/CPU Utility Functions ========================
 static float *read_image_rgb(const char *path, int *out_w, int *out_h) {
     int channels_in_file;
     unsigned char *data_u8 = stbi_load(path, out_w, out_h, &channels_in_file, 3);
